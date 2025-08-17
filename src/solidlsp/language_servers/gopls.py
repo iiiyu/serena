@@ -3,6 +3,7 @@ import os
 import pathlib
 import subprocess
 import threading
+import time
 
 from overrides import override
 
@@ -128,11 +129,38 @@ class Gopls(SolidLanguageServer):
         def window_log_message(msg):
             self.logger.log(f"LSP: window/logMessage: {msg}", logging.INFO)
 
+        def window_show_message(params):
+            """
+            Handle window/showMessage notifications to detect when gopls finishes workspace loading.
+            This is crucial to prevent 'no views' errors that occur when requests are sent before
+            gopls has finished loading the workspace.
+            """
+            message = params.get("message", "")
+            self.logger.log(f"LSP: window/showMessage: {message}", logging.INFO)
+
+            # Check for various completion signals that indicate gopls is ready
+            completion_signals = [
+                "Finished loading workspace",
+                "Loading completed",
+                "Workspace loaded",
+                # Also consider error messages as completion (gopls won't get better without intervention)
+                "Error loading packages",
+                "Failed to load packages",
+            ]
+
+            for signal in completion_signals:
+                if signal in message:
+                    self.logger.log(f"Detected gopls workspace loading completion: {message}", logging.INFO)
+                    if not self.server_ready.is_set():
+                        self.server_ready.set()
+                    return
+
         def do_nothing(params):
             return
 
         self.server.on_request("client/registerCapability", register_capability_handler)
         self.server.on_notification("window/logMessage", window_log_message)
+        self.server.on_notification("window/showMessage", window_show_message)
         self.server.on_notification("$/progress", do_nothing)
         self.server.on_notification("textDocument/publishDiagnostics", do_nothing)
 
@@ -154,6 +182,19 @@ class Gopls(SolidLanguageServer):
         self.server.notify.initialized({})
         self.completions_available.set()
 
-        # gopls server is typically ready immediately after initialization
-        self.server_ready.set()
+        # Wait for gopls to finish loading packages/workspace before proceeding
+        # This prevents "no views" errors that occur when requests are sent too early
+        self.logger.log("Waiting for gopls to finish loading workspace...", logging.INFO)
+
+        # Set a timeout for workspace loading - if no completion signal is received,
+        # we'll proceed anyway after a reasonable delay
+        def fallback_ready():
+            time.sleep(5.0)  # Wait 5 seconds as fallback
+            if not self.server_ready.is_set():
+                self.logger.log("Timeout waiting for gopls workspace loading signal, proceeding anyway", logging.WARNING)
+                self.server_ready.set()
+
+        fallback_thread = threading.Thread(target=fallback_ready, daemon=True)
+        fallback_thread.start()
+
         self.server_ready.wait()
