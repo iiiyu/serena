@@ -4,9 +4,10 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from logging import Logger
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Optional
 
 import click
 from sensai.util import logging
@@ -28,6 +29,7 @@ from serena.constants import (
     USER_CONTEXT_YAMLS_DIR,
     USER_MODE_YAMLS_DIR,
 )
+from serena.instance_manager import SerenaInstanceManager
 from serena.mcp import SerenaMCPFactory, SerenaMCPFactorySingleProcess
 from serena.project import Project
 from serena.tools import FindReferencingSymbolsTool, FindSymbolTool, GetSymbolsOverviewTool, SearchForPatternTool, ToolRegistry
@@ -723,6 +725,158 @@ class ToolCommands(AutoRegisteringGroup):
         click.echo(mcp_tool.description)
 
 
+class InstanceCommands(AutoRegisteringGroup):
+    """Group for managing multiple Serena instances."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            name="instances", help="Commands for managing multiple Serena instances. Run `serena instances <command> --help` for more info."
+        )
+
+    @staticmethod
+    @click.command("list", help="List all running Serena instances.")
+    @click.option("--json", "output_json", is_flag=True, help="Output in JSON format.")
+    def list_instances(output_json: bool) -> None:
+        """List all running Serena instances."""
+        manager = SerenaInstanceManager()
+        instances = manager.get_running_instances()
+
+        if output_json:
+            import json
+
+            click.echo(json.dumps([inst.to_dict() for inst in instances], indent=2))
+        else:
+            if not instances:
+                click.echo("No running Serena instances found.")
+            else:
+                click.echo(f"Found {len(instances)} running instance(s):\n")
+                for inst in instances:
+                    transport_info = f"Port {inst.mcp_port}" if inst.transport == "sse" else "stdio"
+                    dashboard_info = f", Dashboard: http://127.0.0.1:{inst.dashboard_port}/dashboard/" if inst.dashboard_port else ""
+                    uptime = int(time.time() - inst.start_time)
+                    hours, remainder = divmod(uptime, 3600)
+                    minutes, seconds = divmod(remainder, 60)
+                    uptime_str = f"{hours}h {minutes}m {seconds}s" if hours > 0 else f"{minutes}m {seconds}s"
+
+                    click.echo(f"  PID: {inst.pid}")
+                    click.echo(f"    Project: {inst.project_name} ({inst.project_path})")
+                    click.echo(f"    Transport: {inst.transport} ({transport_info}){dashboard_info}")
+                    click.echo(f"    Context: {inst.context}, Modes: {', '.join(inst.modes)}")
+                    click.echo(f"    Uptime: {uptime_str}")
+                    click.echo()
+
+    @staticmethod
+    @click.command("launch", help="Launch a new Serena instance for a project.")
+    @click.argument("project", type=PROJECT_TYPE)
+    @click.option("--transport", type=click.Choice(["stdio", "sse"]), default="stdio", show_default=True, help="Transport protocol.")
+    @click.option("--port", type=int, default=None, help="MCP server port for SSE transport (auto-assigned if not specified).")
+    @click.option(
+        "--context", type=str, default=DEFAULT_CONTEXT, show_default=True, help="Built-in context name or path to custom context YAML."
+    )
+    @click.option(
+        "--mode",
+        "modes",
+        type=str,
+        multiple=True,
+        default=DEFAULT_MODES,
+        show_default=True,
+        help="Built-in mode names or paths to custom mode YAMLs.",
+    )
+    @click.option("--enable-web-dashboard/--no-web-dashboard", default=True, show_default=True, help="Enable web dashboard.")
+    @click.option(
+        "--log-level",
+        type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]),
+        default=None,
+        help="Override log level in config.",
+    )
+    @click.option("--force", is_flag=True, help="Kill existing instance for the same project if it exists.")
+    def launch_instance(
+        project: str,
+        transport: str,
+        port: Optional[int],
+        context: str,
+        modes: tuple[str, ...],
+        enable_web_dashboard: bool,
+        log_level: Optional[str],
+        force: bool,
+    ) -> None:
+        """Launch a new Serena instance for the specified project."""
+        manager = SerenaInstanceManager()
+
+        try:
+            instance = manager.launch_instance(
+                project=project,
+                transport=transport,
+                context=context,
+                modes=modes,
+                mcp_port=port,
+                enable_web_dashboard=enable_web_dashboard,
+                log_level=log_level,
+                force=force,
+            )
+
+            click.echo(f"✅ Launched Serena instance for project '{instance.project_name}'")
+            click.echo(f"   PID: {instance.pid}")
+            if instance.transport == "sse":
+                click.echo(f"   MCP Server: http://127.0.0.1:{instance.mcp_port}")
+            else:
+                click.echo("   Transport: stdio")
+            if instance.dashboard_port:
+                click.echo(f"   Dashboard: http://127.0.0.1:{instance.dashboard_port}/dashboard/")
+        except RuntimeError as e:
+            click.echo(f"❌ Failed to launch instance: {e}", err=True)
+            sys.exit(1)
+
+    @staticmethod
+    @click.command("kill", help="Kill a running Serena instance.")
+    @click.argument("identifier", type=str)
+    def kill_instance(identifier: str) -> None:
+        """Kill a running Serena instance by PID or project name/path."""
+        manager = SerenaInstanceManager()
+
+        # Try to parse as PID first
+        try:
+            pid = int(identifier)
+            if manager.kill_instance(pid):
+                click.echo(f"✅ Killed instance with PID {pid}")
+            else:
+                click.echo(f"❌ No instance found with PID {pid}", err=True)
+                sys.exit(1)
+        except ValueError:
+            # Not a PID, try as project
+            instance = manager.find_instance_by_project(identifier)
+            if instance:
+                if manager.kill_instance(instance.pid):
+                    click.echo(f"✅ Killed instance for project '{instance.project_name}' (PID: {instance.pid})")
+                else:
+                    click.echo(f"❌ Failed to kill instance for project '{instance.project_name}'", err=True)
+                    sys.exit(1)
+            else:
+                click.echo(f"❌ No instance found for project '{identifier}'", err=True)
+                sys.exit(1)
+
+    @staticmethod
+    @click.command("kill-all", help="Kill all running Serena instances.")
+    @click.option("--yes", is_flag=True, help="Skip confirmation prompt.")
+    def kill_all_instances(yes: bool) -> None:
+        """Kill all running Serena instances."""
+        manager = SerenaInstanceManager()
+        instances = manager.get_running_instances()
+
+        if not instances:
+            click.echo("No running instances to kill.")
+            return
+
+        if not yes:
+            click.echo(f"This will kill {len(instances)} running instance(s).")
+            if not click.confirm("Are you sure?"):
+                click.echo("Aborted.")
+                return
+
+        killed = manager.kill_all_instances()
+        click.echo(f"✅ Killed {killed} instance(s)")
+
+
 class PromptCommands(AutoRegisteringGroup):
     def __init__(self) -> None:
         super().__init__(name="prompts", help="Commands related to Serena's prompts that are outside of contexts and modes.")
@@ -814,6 +968,7 @@ context = ContextCommands()
 project = ProjectCommands()
 config = SerenaConfigCommands()
 tools = ToolCommands()
+instances = InstanceCommands()
 prompts = PromptCommands()
 
 # Expose toplevel commands for the same reason
@@ -822,7 +977,7 @@ start_mcp_server = top_level.start_mcp_server
 index_project = project.index_deprecated
 
 # needed for the help script to work - register all subcommands to the top-level group
-for subgroup in (mode, context, project, config, tools, prompts):
+for subgroup in (mode, context, project, config, tools, instances, prompts):
     top_level.add_command(subgroup)
 
 
